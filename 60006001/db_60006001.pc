@@ -1,0 +1,341 @@
+EXEC SQL include "oradb/oradbifs_in.h";
+#include "log4c/trace.h"
+#include <string.h>
+#include <assert.h>
+#include "xml/node.h"
+#include "xml2st/xml2st.h"
+#include "tuxsvc/context.h"
+#include "openssl/sha.h"
+#include "crypto/base64.h"
+#include "str/str_trim.h"
+#include "oradb/dac/tmemacctbal.h"
+#include "oradb/dac/tmemsacctbal.h"
+#include "oradb/dac/tmemtopbal.h"
+#include "60006001/60006001.h"
+#include "60006001/t60006001_i.h"
+#include "60006001/db_60006001.h"
+#include "wahbuysvc.h"
+
+
+
+//检查挂牌状态
+int db_60006001_check_status(char * listedno)
+{
+    LOCSQLCA;
+    long status;
+    EXEC SQL select Fi_status into :status from tlistedsell where Fs_ListedNo = :listedno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( " 挂牌单状态失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    if(status != 100)
+    {
+        cnacex_trace_error( " 挂牌单状态不正确：[%ld]", status);
+        return 1;
+    }
+    return 0;
+}
+
+//检查买方权限
+int db_60006001_check_right(char * mid ,char* storeno)
+{
+    LOCSQLCA;
+    int i = 0;
+    EXEC SQL select count(1) into :i from tproviderinfo where Fs_StoreNo = :storeno and Fs_ProvId = :mid;
+    if(SQL_NOT_SUCC || i != 1)
+    {
+        cnacex_trace_error( "买方非仓单所在仓库的仓储会员sqlcode：[%d]", SQL_CODE);
+        return 1;
+    }
+    return 0;
+}
+
+int db_60006001_memlev(char *mid ,char level[3+1])
+{
+    LOCSQLCA;
+
+    EXEC SQL select Fs_MemLevel into :level from tmemberinfo where Fs_MID = :mid;
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取会员等级失败sqlcode：[%d]", SQL_CODE);
+        return SQL_CODE;
+    }
+    return 0;
+
+}
+
+int db_60006001_payment(char * listedno, double *payment, char marketcode[2+1],double * SpValUnit )
+{
+
+    LOCSQLCA;
+
+    EXEC SQL select (Fi_QTY * Fd_UP),Fs_MarkCode ,Fi_QTY into :payment ,:marketcode ,:SpValUnit from tlistedsell where Fs_ListedNo = :listedno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取挂牌单总货款金额失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+    return 0;
+}
+int db_get_wahinfo(char* listedno,char wrno[20+1],char rcpno[20+1],char goodsno[20+1],char storeno[12+1],char Invoice[1+1])
+{
+
+    LOCSQLCA;
+
+    //先获取注册仓单号wrno
+    EXEC SQL SELECT FS_WRNO,Fs_Invoice INTO :wrno ,:Invoice FROM TLISTEDSELL WHERE FS_LISTEDNO = :listedno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取注册仓单号失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    //获取签发仓单号rcpno
+    EXEC SQL SELECT FS_RECEIPTNO INTO :rcpno FROM TREGISTINGRECEIPT WHERE FS_REGISTNO = :wrno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取签发仓单号失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    //获取货物编号goodsno
+    EXEC SQL SELECT Fs_cargoNo INTO :goodsno FROM TNORMALRECEIPT WHERE Fs_receiptNo = :rcpno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取签发仓单号失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    //获取该被摘牌仓单所在的仓库编号
+
+    exec sql select Fs_StoreNo into :storeno from tcargoinfo where Fs_cargoNo = :goodsno;
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "获取仓库编号失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+    return 0;
+}
+int db_60006001_insert_baseinfo( t60006001_i_root_t * root,char dsno[20+1],char auditno[20+1],char * wrno,char * listno, char * goodsno)
+
+{
+    LOCSQLCA;
+    //char rcpno[20+1] = {0}; // 签发仓单号
+    //char wrno[20+1] = {0}; //注册仓单号
+    //char dsno[20+1] = {0}; //摘牌编号
+    //char goodsno[20+1] = {0}; //货物编号
+    //char auditno[20+1] = {0};
+
+    if(!root->body)
+    {
+        cnacex_trace_warn( "请求xml中body为空");
+        return 1;
+    }
+
+    //注册仓单已挂牌
+    //EXEC SQL  update  TREGISTINGRECEIPT set  Fi_status = 1 WHERE Fs_registNo = :wrno;
+    //EXEC SQL  update  tlistedsell set  Fi_status = 998 WHERE Fs_listedNo = :listno;//挂牌编号！已售罄
+
+//    if(SQL_NOT_SUCC)
+//    {
+//        cnacex_trace_error( "刷新失败sqlcode：[%d]", SQL_CODE);
+//        return SQL_CODE;
+//    }
+
+
+    //生成订单编号 插入订单数据表tdelistbuy
+
+    //两位固定字符 'DB'
+    EXEC SQL Select 'DB'||to_char(SYSDATE, 'YYYYMMDDhh24miss')||to_char(lsdbno_seq.nextval, 'fm0999') into :dsno from dual;
+
+    EXEC SQL Select trdaudit_seq.nextval into :auditno from dual;
+
+    cnacex_string_trimright(auditno);
+    //先插入摘牌表（订单数据表）所有的not null
+    EXEC SQL insert into tdelistbuy
+    (
+        Fs_DelistNo,//	摘牌编号
+        Fs_MID	,//摘牌买方
+        Fs_ListedNo	,//挂牌编号
+        Fs_TxOper,//交易员
+        Fs_ListedType,//	挂牌方式
+        Fs_COMMCode,//	商品代码
+        Fs_ClassCode	,//品类代码
+        Fs_MarkCode	,//市场代码
+        Fd_UP	,//单价
+        Fs_FPFlg	,//一口价标识
+        Fi_QTY	,//商品总量
+        Fs_WholeFlg,//	整单标识
+        Fi_REM	,//剩余数量
+        Fd_DOD	,//摘牌日期
+        Fd_DOE	,//挂牌有效期
+        Fs_Storage	,//交货仓库
+        Fi_Vol	,//购买数量
+        Fs_TOP	,//付款方式
+        Fs_Invoice	,//平台监管发票
+        Fi_Status	,//摘牌状态
+        Fi_AuditNo,//审核编号
+        Fs_EffRec	,//记录生效标志
+        Fs_DAC	//数据校验码
+         )
+
+    values(:dsno, :BODY->mid,:BODY->listedno,:BODY->proposer,'W','spdm','pldm','sc',0,'V',0,'W',0,sysdate,sysdate,'jhck',0,'F','Y',0,:auditno,'1','dac');
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+
+
+    exec sql update tdelistbuy   set  (Fi_QTY ,Fi_Vol,Fd_UP) =
+    (select  Fi_QTY , Fi_QTY ,Fd_price from tregistingreceipt where  Fs_registNo = :wrno ) where  Fs_DelistNo = :dsno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    exec sql update tdelistbuy  set  (  Fs_COMMCode,//	商品代码
+                                        Fs_ClassCode	,//品类代码
+                                        Fs_MarkCode	,//市场代码
+                                        Fs_Storage
+                                    ) =
+    (select  Fs_COMMCode,Fs_ClassCode,Fs_MarkCode, Fs_StoreNo  from tcargoinfo where  Fs_cargoNo = :goodsno )
+
+    where  Fs_DelistNo = :dsno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+    exec sql update tdelistbuy   set   Fs_Invoice =
+    (select  Fs_Invoice  from tlistedsell where  Fs_ListedNo = :listno )
+    where  Fs_DelistNo = :dsno;
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+
+//再插入DAC。。。
+
+    return 0;
+}
+int db_insert_feelist( char * ListedNo,char *costcode, char* TrType,double costamt,char* mid )
+{
+    LOCSQLCA;
+    EXEC SQL INSERT INTO TDBEX_FEE (Fs_DelistNo,
+
+                                    Fs_CostCode,
+                                    Fs_TrType,
+                                    Fd_CostAmt,
+                                    Fi_Flag,
+                                    Fs_OccMID,
+                                    Fd_LogTime
+    )
+        VALUES (:ListedNo,:costcode,:TrType,:costamt,1,:mid,sysdate);
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌费用表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+
+    return 0;
+}
+//插入审核表
+int db_insert_tdbaudit(char* dsno,char* auditno)
+{
+    LOCSQLCA;
+
+    exec sql insert into tdbaudit (
+    Fi_AuditNo,//	审核编号
+    Fs_AuditType,//	审核类型
+    Fs_DelistNo	,//摘牌编号
+    Fs_ListedNo	,//挂牌编号
+    Fs_ListedType	,//挂牌方式
+    Fs_COMMCode	,//商品代码
+    Fs_ClassCode	,//品类代码
+    Fs_MarkCode	,//市场代码
+    Fd_UP	,//单价
+    Fs_FPFlg	,//一口价标识
+    Fi_QTY	,//商品总量
+    Fs_WholeFlg,//	整单标识
+    Fi_REM	,//剩余数量
+    Fd_DOD	,//摘牌日期
+    Fd_DOE	,//挂牌有效期
+    Fs_Storage	,//交货仓库
+    Fi_Vol	,//购买数量
+    Fs_TOP	,//付款方式
+    Fs_Invoice	,//平台监管发票
+    Fs_DAC	,//数据校验码
+    Fs_Proposer,//	申请人
+    Fd_ApplyTime	//申请时间
+    )
+    values(:auditno,0,:dsno,'0','W','spdm','pldm','sc',0,'V',0,'W',0,sysdate,sysdate,'jhck',0,'F','Y','dac','mid',sysdate);
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error( "插入摘牌审核表失败sqlcode：[%d]", SQL_CODE);
+
+        return SQL_CODE;
+    }
+    EXEC SQL UPDATE  TDBAUDIT
+    SET (      FS_LISTEDNO,FS_COMMCODE,FS_CLASSCODE,FS_MARKCODE,FD_UP,FI_QTY,FD_DOD,FD_DOE,FS_STORAGE,FI_VOL,FS_TOP,Fs_MID,FS_PROPOSER)
+    = ( SELECT FS_LISTEDNO,FS_COMMCODE,FS_CLASSCODE,FS_MARKCODE,FD_UP,FI_QTY,FD_DOD,FD_DOE,FS_STORAGE,FI_VOL,FS_TOP,Fs_MID,NVL(Fs_TxOper,chr(0))
+        FROM TDELISTBUY WHERE FS_DELISTNO = : dsno)
+    WHERE  FI_AUDITNO = :auditno;
+
+    if(SQL_NOT_SUCC)
+    {
+        cnacex_trace_error("dsno : %s" ,dsno);
+        cnacex_trace_error( "插入摘牌审核表失败sqlcode：[%d]", SQL_CODE);
+        return SQL_CODE;
+    }
+
+    return 0;
+}
+
+
+//获取挂牌单号 以及卖家mid
+int db_60006001_get_sellerinfo(char* dsno ,char listno[20+1],char seller[12+1])
+{
+    LOCSQLCA;
+
+    exec sql select  Fs_ListedNo into :listno     from  tdelistbuy  where  Fs_DelistNo = :dsno;
+    if(SQL_NOT_SUCC  )
+    {
+        cnacex_trace_error( "获取挂牌单号 sqlcode：[%d] ", SQL_CODE);
+        return SQL_CODE;
+    }
+
+    exec sql select  Fs_MID  into :seller from   tlistedsell where Fs_ListedNo = :listno;
+
+    if(SQL_NOT_SUCC  )
+    {
+        cnacex_trace_error( "获取卖家mid失败sqlcode：[%d] ", SQL_CODE);
+        return SQL_CODE;
+    }
+
+    return 0;
+}
